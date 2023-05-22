@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "pdf-assist"
+version = "0.1.0"
+description = ""
+authors = ["nodreb-borrus <nodreb@borr.us>"]
+readme = "README.md"
+packages = [{include = "pdf_assist"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+langchain = "^0.0.174"
+python-dotenv = "^1.0.0"
+openai = "^0.27.7"
+tiktoken = "^0.4.0"
+pymupdf = "^1.22.3"
+pypdf = "^3.8.1"
+numpy = "^1.24.3"
+scikit-learn = "^1.2.2"
+pgvector = "^0.1.8"
+psycopg2-binary = "^2.9.6"
+sqlmodel = "^0.0.8"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,8 +1,10 @@
 import os
 from typing import List, Optional
+import sqlalchemy
 from sqlmodel import Field, SQLModel, Column, create_engine
 from pgvector.sqlalchemy import Vector
 from langchain.vectorstores.pgvector import PGVector
+
 
 class Book(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -15,6 +17,8 @@ class Chapter(SQLModel, table=True):
     name: str
 
 
+# Represents a logical section, smaller than a chapter.
+# For example when text is broken by an extra newline and changes context
 class Section(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     chapter_id: Optional[int] = Field(default=None, foreign_key="chapter.id")
@@ -43,9 +47,11 @@ CONNECTION_STRING = PGVector.connection_string_from_db_params(
 # Manually:
 # CREATE DATABASE pdf_assist;
 # CREATE EXTENSION vector;
-engine = create_engine(CONNECTION_STRING)
+engine = None
+try:
+    engine = create_engine(CONNECTION_STRING)
 # Don't use after fetching embeddings (NOW)
 # SQLModel.metadata.drop_all(engine)
-SQLModel.metadata.create_all(engine)
-
-
+    SQLModel.metadata.create_all(engine)
+except sqlalchemy.exc.OperationalError as e:
+    print("Could not connect to database.")

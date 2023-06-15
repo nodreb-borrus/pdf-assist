@@ -1,18 +1,26 @@
 import os
 import re
-import math
 import fitz
-import random
 from typing import List
 from langchain.llms import OpenAI
 from langchain.embeddings import OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from pydantic import BaseModel
 from sqlmodel import Session
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from database import Book, Chapter, Section, engine
+from util import FakeEmbeddings, map_lengths, map_tokens, split_doc, map_splits, calculate_checksum
+from database import (
+    Book,
+    Chapter,
+    Chunk,
+    ChunkBatch,
+    SectionBatch,
+    SectionChunk,
+    SectionL,
+    engine,
+)
 
 
 def flags_decomposer(flags):
@@ -122,62 +130,24 @@ def merge_block_texts(first, second):
     return first_non_break + second
 
 
-def map_lengths(docs):
-    lengths = []
-    for doc in docs:
-        lengths.append(len(doc))
-    return lengths
-
-
-def map_tokens(llm, docs):
-    lengths = []
-    for doc in docs:
-        lengths.append(llm.get_num_tokens(doc))
-    return lengths
-
-
-def round_up_to_next_even_thousand(number):
-    rounded_number = math.ceil(number / 1000) * 1000
-    # rounded_number = number + 500
-    return rounded_number
-
-
-def calculate_even_length(text_length, max_length):
-    num_chunks = math.ceil(text_length / max_length)
-    even_length = math.ceil(text_length / num_chunks)
-    return even_length
-
-
-# Take a list of docs, and return a new larger list where large docs above certain
-# size are split into roughly even chunks
-def map_splits(max_length, docs):
-    text_splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", "\t", ". "], chunk_size=max_length, chunk_overlap=0
-    )
-
-    splits = []
-    for doc in docs:
-        if len(doc) > max_length:
-            # print(f"SEC {len(doc)} {round_up_to_next_even_thousand(len(doc))}")
-            chunk_size = calculate_even_length(
-                round_up_to_next_even_thousand(len(doc)), max_length
-            )
-            # print(f"EVEn {chunk_size}")
-            text_splitter._chunk_size = chunk_size + 100
-            docs = text_splitter.create_documents([doc])
-            for d in docs:
-                # print(len(d.page_content))
-                splits.append((d.page_content))
-        else:
-            splits.append(doc)
-    return splits
-
-
 # Specify the path to your PDF file
 pdf_path = "./data/OUSPENSKY, P.D. - In Search of the Miraculous.pdf"
+# pdf_path = "./data/GURDJIEFF, G.I. - Beelzebub's Tales to His Grandson.pdf"
 book_name = os.path.splitext(os.path.basename(pdf_path))[0]
 
 llm = OpenAI(model_name="gpt-3.5-turbo")  # pyright:ignore
+
+
+class TocChapter(BaseModel):
+    level: int
+    title: str
+    page: int
+    length: int
+
+
+def table_of_contents(fitz_doc):
+    return []
+
 
 with fitz.open(pdf_path) as doc:
     # Get chapter page numbers from toc
@@ -188,7 +158,7 @@ with fitz.open(pdf_path) as doc:
             level = entry[0]
             title = entry[1]
             page_num = entry[2]
-            print(f"{level} {title}: Page {page_num}")
+            # print(f"{level} {title}: Page {page_num}")
             chapter_page_starts.append(page_num)
 
     # Calculate lengths of each chapter using toc
@@ -199,8 +169,8 @@ with fitz.open(pdf_path) as doc:
         else:
             chapter_lengths.append(chapter_page_starts[i + 1] - page_num)
 
-    print(chapter_page_starts)
-    print(chapter_lengths)
+    # print(chapter_page_starts)
+    # print(chapter_lengths)
 
     # Build up chapers using entire page text
     full_chapters: List[str] = []
@@ -215,6 +185,9 @@ with fitz.open(pdf_path) as doc:
     section_list = []
     section_chapters = []
     working_section_chapter = []
+
+    # Signal to the next page that previous page ended with short section so merge
+    force_merge = False
 
     # Main loop, go through page by page
     for i, page in enumerate(doc):
@@ -251,33 +224,64 @@ with fitz.open(pdf_path) as doc:
                 working_block_chapter.append(block[4])
 
         sections = detect_sections(page)
-        # if len(sections) > 4:
-        #     print("Page", page_num)
-        #     for sec in sections:
-        #         print(len(sec))
+
+        # BIG NOTES ENERGY
+        # DONE We are fixing broken sentences across pages!
+        # DONE 3+ small sections on a page: merge (how to merge also with adjacent?, these are usually figures)
+        # MAYBE  ^ try also just merging them all up to previous regardless of previous length
+        # DONE Small section at beginning of page: prob merge with previous page section
+        # DONE Small section at end of page: prob merge with following page
+        # 2HARD Images: merge before and after sections (Chapter 5)
+        # Small section ending with : ; etc.: merge down
+        # Pages ending on sentence, sections not small, but should be merged still
+        # Legit separate sections which are just small and lose surrounding context
+        # Page 240: small sections with images should be merged to both prev and next pages
+        # TODO Need to deal with footnotes: breaks broken line detection
+
+        small_size = 650
+        smaller_size = 450  # Don't go smaller, it will consume chapter labels
         for j, section in enumerate(sections):
             # Continue sections across pages as with blocks
             if (
-                section_list
-                and working_section_chapter
-                and j == 0
-                and incomplete_text(section_list[-1] + " \n")
+                (
+                    section_list
+                    and working_section_chapter
+                    and j == 0
+                    and (
+                        # Text broken across pages
+                        incomplete_text(section_list[-1] + " \n")
+                        # Top section of page is short
+                        or len(section) < small_size
+                    )
+                )
                 # Combine multiple small sections on one page
-            ) or (
-                len(sections) > 4
-                and j != 0
-                and len(section_list[-1]) < 650
-                and len(section) < 350
+                or (
+                    len(sections) > 2
+                    and j != 0
+                    and len(section_list[-1]) < small_size
+                    and len(section) < smaller_size
+                )
+                or force_merge
             ):
                 new_previous_section = merge_block_texts(
                     section_list[-1] + " \n", section
                 )
                 section_list[-1] = new_previous_section
                 working_section_chapter[-1] = new_previous_section
-            # Omit leftover short sections
-            elif len(section) > 75:
+                force_merge = False
+            else:
+                # if len(sections) - 1 == j and len(section) < 650:
+                #     force_merge = True
+                # print(page_num)
                 section_list.append(section)
                 working_section_chapter.append(section)
+
+            # If last section on page is short, merge with next page
+            # or if a section ends with colon, merge with next section
+            if (len(sections) - 1 == j and len(section) < 650) or (
+                section.strip()[-1] == ":" or section.strip()[-1] == ";"
+            ):
+                force_merge = True
 
         # When on last page of the chapter/book, wrap up working chapters
         if (
@@ -293,14 +297,19 @@ with fitz.open(pdf_path) as doc:
             section_chapters.append(working_section_chapter)
             working_section_chapter = []
 
+            force_merge = False
+
     # Use chapters after generating
+    # Print start text and length/token info
     # for i, chapter in enumerate(full_chapters):
     #     lent = len(chapter)
     #     toks = llm.get_num_tokens(chapter)
     #     page_len = chapter_lengths[i]
-    #     print(f"{len(chapter)} {chapter_lengths[i]} {len(chapter)/chapter_lengths[i]}")
-    #     print(f"{toks} {toks/page_len}")
+
     #     print(chapter[:65].encode("utf-8"))
+    #     print(f"Length: {len(chapter)} Page length: {chapter_lengths[i]} Length/page: {len(chapter)/chapter_lengths[i]}")
+    #     print(f"Tokens: {toks} Token/page: {toks/page_len}")
+    #     print()
 
     # Count blocks in each chapter, show avg blocks per page
     # for i, chapter in enumerate(block_chapters):
@@ -315,7 +324,11 @@ with fitz.open(pdf_path) as doc:
     # for i, s in enumerate(section_list):
     #     tokens = llm.get_num_tokens(s)
     #     section_lengths.append(len(s))
+    # print(section_lengths)
     # print(sorted(section_lengths))
+
+    # TODO remove sections not greater than 75 chars
+    # This is bespoke value in In Search Of for irrelevent sections
 
     print(f"Chapters: {len(full_chapters)}")
 
@@ -357,43 +370,41 @@ with fitz.open(pdf_path) as doc:
 # print(f"This book has {num_tokens} tokens in it")
 
 
-# split_secs = map_splits(5000, section_list)
-# section_lengths = map_lengths(split_secs)
-# section_tokens = map_tokens(llm, split_secs)
-# print(section_lengths)
-# print(section_tokens)
-# print(sorted(section_lengths))
-# print(len(section_list))
-# print(len(section_lengths))
-
-for chap in section_chapters:
-    print(len(chap))
+# Look at section chapters before and after splitting
+for i, chap in enumerate(section_chapters):
+    # print(f"Chapter {i-1}")
     print(map_lengths(chap))
-    split_chap = map_splits(5000, chap)
+    split_chap = map_splits("recursive", 5000, chap)
     print(map_lengths(split_chap))
+    print(map_tokens(llm, chap))
+    for j, sec in enumerate(split_chap):
+        if len(sec) < 650:
+            print(j, sec)
+        else:
+            print(j, sec[:200].encode("utf-8"))
+    print()
 
 
-embeddings = OpenAIEmbeddings()
-# print(f"Contents Sections")
-# for i, sec in enumerate(split_secs[:19]):
-#     print(f"{i} {sec}")
-
-# vectors = embeddings.embed_documents([split_secs[322]])
-# print(vectors)
-
-
-def fake_vector():
-    vec = []
-    for _ in range(1536):
-        vec.append(random.uniform(0, 1))
-    return vec
-
-def store_book_with_embeddings():
+def printin():
     with Session(engine) as session:
-        # Create the book
-        book = Book(name=book_name)
-        session.add(book)
-        session.commit()
+        book = Book.get(session, name=book_name)
+        print(book)
+        if book:
+            chap = Chapter.get(session, book_id=book.id, name="CONTENTS")
+            print(chap)
+
+
+# printin()
+
+
+def store_book_with_embeddings(fake_vector=True):
+    if fake_vector:
+        embeddings = FakeEmbeddings()
+    else:
+        embeddings = OpenAIEmbeddings()  # pyright: ignore
+
+    with Session(engine) as session:
+        book = Book.get_or_create(session, name=book_name)
 
         # Create all the chapters
         ordered_chapters = []
@@ -401,35 +412,81 @@ def store_book_with_embeddings():
             if i == 0:  # Skip title page
                 continue
             elif i == 1:
-                chap = Chapter(name="CONTENTS", book_id=book.id)
+                chap = Chapter.get_or_create(session, name="CONTENTS", book_id=book.id)
             else:
                 # 3rd item is Chapter 1
                 chap_name = str(i - 1)
-                chap = Chapter(name=chap_name, book_id=book.id)
+                chap = Chapter.get_or_create(session, name=chap_name, book_id=book.id)
 
-            session.add(chap)
             ordered_chapters.append(chap)
 
-        session.commit()
+        # Create a SectionBatch so we can keep copies of old sections made with different algorithm
+        # Change the tag to make new batch
+        batch_tag = "SmallSecFixes"
+        sec_batch = SectionBatch.get(session, tag=batch_tag)
 
-        # Create all the text sections
-        for i, chapter in enumerate(ordered_chapters):
-            # Skip empty title page
-            sections = section_chapters[i + 1]
-            vectors = embeddings.embed_documents(sections)
-            print(f"Chapter {chapter.name} embeddings fetched.")
-            for j, section in enumerate(sections):
-                sec = Section(
-                    chapter_id=chapter.id,
-                    chapter_index=j,
-                    text=section,
-                    embedding=vectors[j],
+        if not sec_batch:
+            sec_batch = SectionBatch.create(session, tag=batch_tag)
+            print(sec_batch)
+
+            # Create all the text sections
+            for i, chapter in enumerate(ordered_chapters):
+                # Skip empty title page
+                sections = section_chapters[i + 1]
+                vectors = embeddings.embed_documents(sections)
+                print(f"Chapter {chapter.name} embeddings fetched.")
+                for j, section in enumerate(sections):
+                    sec = SectionL(
+                        chapter_id=chapter.id,
+                        batch_id=sec_batch.id,
+                        index=j,
+                        text=section,
+                        checksum=calculate_checksum(section),
+                    )
+                    session.add(sec)
+
+            session.commit()
+
+        # Fetch all the sections
+        sections = SectionL.get_all(session, batch_id=sec_batch.id)
+
+        # Create a chunk batch to keep copies of old chunks made with different params
+        # Change the tag to save a new batch
+        chunk_tag = batch_tag + "-Spacy-2000-05-26"
+        chunk_batch = ChunkBatch.get(session, tag=chunk_tag)
+
+        if not chunk_batch:
+            chunk_batch = ChunkBatch.create(session, tag=chunk_tag)
+
+            # Create all the chunks with embeddings
+            for i, section in enumerate(sections):
+                # Skip chapter headings, and weird small thing
+                if len(section.text) < 75:
+                    continue
+
+                splits = split_doc("spacy", 2000, section.text)
+                vectors = embeddings.embed_documents(splits)
+                print(
+                    f"Section {section.chapter_id} {section.index} embeddings fetched."
                 )
-                session.add(sec)
+                for j, split in enumerate(splits):
+                    chunk = Chunk.create(
+                        session,
+                        batch_id=chunk_batch.id,
+                        text=split,
+                        checksum=calculate_checksum(split),
+                        embedding=vectors[j],
+                    )
+                    sec_chunk = SectionChunk(
+                        section_id=section.id, chunk_id=chunk.id, index=j
+                    )
+                    session.add(sec_chunk)
 
-        session.commit()
+            session.commit()
 
 
 # Actually fetch embeddings into db
 # Do only once
+# store_book_with_embeddings(fake_vector=False)
+
 # store_book_with_embeddings()
